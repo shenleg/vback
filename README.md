@@ -181,13 +181,13 @@ curl -fsSL https://raw.githubusercontent.com/shenleg/vback/main/vback.sh -o /usr
   && vback
 
 # 运行配置向导
-./vback.sh setup
+vback.sh setup
 
 # 测试连接
-./vback.sh test
+vback.sh test
 
 # 执行备份
-./vback.sh backup
+vback.sh backup
 ```
 
 ### 核心概念
