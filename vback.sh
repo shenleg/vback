@@ -2760,13 +2760,14 @@ select_provider() {
 setup_wizard() {
     local setup_task_id="${DEFAULT_TASK_ID}"
     local setup_task_name=""
-    
-    if [[ -z "$setup_task_id" ]]; then
-        setup_task_id="$(create_task "$(default_task_name)")"
-    elif ! task_exists "$setup_task_id"; then
-        setup_task_id="$(create_task "$(default_task_name)")"
+    local initial_task_name=""
+
+    if [[ -z "$setup_task_id" ]] || ! task_exists "$setup_task_id"; then
+        initial_task_name="$(default_task_name)"
+        setup_task_id="$(generate_task_id "$initial_task_name")"
+        create_task "$initial_task_name" "$setup_task_id" >/dev/null
     fi
-    
+
     load_task_context "$setup_task_id"
     setup_task_name="$(task_display_name "$setup_task_id")"
     
@@ -3270,7 +3271,8 @@ menu_tasks() {
                 new_task_name="$(default_task_name)"
                 input_field "${L[task_name]}" "$new_task_name" new_task_name false
                 local new_task_id
-                new_task_id="$(create_task "$new_task_name")"
+                new_task_id="$(generate_task_id "$new_task_name")"
+                create_task "$new_task_name" "$new_task_id" >/dev/null
                 ACTIVE_TASK_ID="$new_task_id"
                 load_task_context "$new_task_id"
                 save_config
