@@ -127,7 +127,7 @@ s3cmd --version   # 或 aws --version
 方式一：本地运行（推荐快速体验）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/caigg188/vback/main/vback.sh -o vback.sh \
+curl -fsSL https://raw.githubusercontent.com/shenleg/vback/main/vback.sh -o vback.sh \
   && chmod +x vback.sh \
   && ./vback.sh
 ```
@@ -135,9 +135,12 @@ curl -fsSL https://raw.githubusercontent.com/caigg188/vback/main/vback.sh -o vba
 方式二：全局安装（推荐生产使用）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/caigg188/vback/main/vback.sh -o /usr/local/bin/vback \
+curl -fsSL https://raw.githubusercontent.com/shenleg/vback/main/vback.sh -o /usr/local/bin/vback \
   && chmod +x /usr/local/bin/vback \
   && vback
+
+# 卸载
+rm /usr/local/bin/vback
 ```
 
 第一次运行会自动进入配置向导。
@@ -169,9 +172,13 @@ curl -fsSL https://raw.githubusercontent.com/caigg188/vback/main/vback.sh -o /us
 首次使用建议：
 
 ```bash
+# 安装依赖
+sudo apt install -y rsync sqlite3
+
 # 下载脚本
-curl -fsSL https://raw.githubusercontent.com/caigg188/vback/main/vback.sh -o vback.sh \
-  && chmod +x vback.sh
+curl -fsSL https://raw.githubusercontent.com/shenleg/vback/main/vback.sh -o /usr/local/bin/vback \
+  && chmod +x /usr/local/bin/vback \
+  && vback
 
 # 运行配置向导
 ./vback.sh setup
