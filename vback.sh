@@ -3167,9 +3167,13 @@ menu_test() {
 
 edit_task_menu() {
     local task_id="$1"
+
+    # 只在进入菜单时加载一次任务上下文。
+    # 若放在循环内，每次迭代都会从存储重读，覆盖掉子编辑器中对全局变量
+    # (BACKUP_DIRS / BACKUP_PREFIX / MAX_BACKUPS 等) 的修改，导致保存时写回旧值。
+    load_task_context "$task_id"
     
     while true; do
-        load_task_context "$task_id"
         show_header
         echo -e "  ${C_TITLE}▸ ${L[backup_tasks]}${C_RESET}"
         echo ""
