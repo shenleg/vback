@@ -1992,22 +1992,50 @@ backup_sqlite_db() {
     cp "$db_file" "$backup_file" 2>/dev/null
 }
 
+# 将源目录复制到临时备份目录，SQLite 安全备份也遵守用户排除规则。
+# 参数：源目录、临时备份目录。输出成功备份的数据库数量；数据库筛选失败时返回非零状态。
 prepare_safe_copy() {
     local src_dir="$1" dest_dir="$2"
     local db_count=0
-    
+    local db_files=()
+
     mkdir -p "$dest_dir"
-    
+
     local exclude_args=()
     for p in "${EXCLUDE_PATTERNS[@]}"; do
         exclude_args+=(--exclude="$p")
     done
-    
+
     if [[ "$SQLITE_SAFE_BACKUP" == "true" ]]; then
+        if command -v rsync &>/dev/null; then
+            local db_list encoded_path rel_path escape decoded
+            # 复用 rsync 的筛选规则而不复制数据库；忽略时间比较，确保临时目录中已有的数据库也会刷新。
+            db_list=$(rsync -an --ignore-times --out-format='%n' "${exclude_args[@]}" \
+                --include='*/' --include='*.db' --include='*.sqlite' --exclude='*' \
+                "$src_dir/" "$dest_dir/") || return 1
+            while IFS= read -r encoded_path; do
+                [[ "$encoded_path" == */ ]] && continue
+                rel_path=""
+                # rsync 会将换行等字符编码为 \#ooo；逐段解码，避免误解码文件名中的原始反斜杠。
+                while [[ "$encoded_path" =~ \\#([0-7]{3}) ]]; do
+                    escape="${BASH_REMATCH[0]}"
+                    rel_path+="${encoded_path%%"$escape"*}"
+                    printf -v decoded '%b' "\\${BASH_REMATCH[1]}"
+                    rel_path+="$decoded"
+                    encoded_path="${encoded_path#*"$escape"}"
+                done
+                rel_path+="$encoded_path"
+                [[ -f "$src_dir/$rel_path" && ! -L "$src_dir/$rel_path" ]] && db_files+=("$src_dir/$rel_path")
+            done <<< "$db_list"
+        else
+            while IFS= read -r -d '' db_file; do
+                db_files+=("$db_file")
+            done < <(find "$src_dir" -type f \( -name "*.db" -o -name "*.sqlite" \) -print0 2>/dev/null)
+        fi
         exclude_args+=(--exclude='*.db' --exclude='*.sqlite')
         exclude_args+=(--exclude='*.db-wal' --exclude='*.db-shm' --exclude='*.db-journal')
     fi
-    
+
     if command -v rsync &>/dev/null; then
         rsync -a "${exclude_args[@]}" "$src_dir/" "$dest_dir/" 2>/dev/null
     else
@@ -2015,18 +2043,18 @@ prepare_safe_copy() {
         cp -a "$src_dir/." "$dest_dir/" 2>/dev/null || cp -pR "$src_dir/." "$dest_dir/" 2>/dev/null
         warn "${L[warn_no_rsync]}"
     fi
-    
+
     if [[ "$SQLITE_SAFE_BACKUP" == "true" ]]; then
-        while IFS= read -r -d '' db_file; do
+        for db_file in "${db_files[@]}"; do
             local rel_path="${db_file#$src_dir/}"
             local dest_file="$dest_dir/$rel_path"
             mkdir -p "$(dirname "$dest_file")"
             backup_sqlite_db "$db_file" "$dest_file" && ((db_count++))
-        done < <(find "$src_dir" -type f \( -name "*.db" -o -name "*.sqlite" \) -print0 2>/dev/null)
-        
+        done
+
         [[ $db_count -gt 0 ]] && info "SQLite: ${C_NUMBER}${db_count}${C_RESET} ${L[sqlite_dbs]}"
     fi
-    
+
     echo "$db_count"
 }
 
@@ -2139,6 +2167,8 @@ get_dir_size() {
 count_files() { find "$1" -type f 2>/dev/null | wc -l; }
 count_sqlite_dbs() { find "$1" -type f \( -name "*.db" -o -name "*.sqlite" \) 2>/dev/null | wc -l; }
 
+# 按任务规则准备单个源目录，打包并上传到云存储。
+# 参数：源目录、备份时间戳。成功返回 0；准备、打包、上传或校验失败时返回非零状态。
 backup_dir() {
     local src="$1" ts="$2"
     local name=$(basename "$src")
@@ -2156,7 +2186,7 @@ backup_dir() {
     local work_dir="$TEMP_DIR/${name}"
     
     info "${L[preparing_files]}..."
-    prepare_safe_copy "$src" "$work_dir"
+    prepare_safe_copy "$src" "$work_dir" || return 1
     
     local archive_file s3_key
     if [[ "$COMPRESS_BACKUP" == "true" ]]; then
