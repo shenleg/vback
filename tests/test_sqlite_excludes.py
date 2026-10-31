@@ -53,9 +53,15 @@ class SQLiteExcludeTests(unittest.TestCase):
             else:
                 path.write_text("backup-test")
 
-    def prepare_copy(self, *patterns, safe_backup=True):
-        """使用给定排除规则运行真实复制函数，返回结果文件集合；执行失败时测试失败。"""
-        command = "set -o pipefail\n" + self.backup_functions + """
+    def prepare_copy(self, *patterns, safe_backup=True, rsync_available=True):
+        """按排除规则和工具可用性执行真实复制，返回文件集合；执行失败时测试失败。"""
+        hide_rsync = "" if rsync_available else """
+command() {
+    if [[ "$1" == -v && "$2" == rsync ]]; then return 1; fi
+    builtin command "$@"
+}
+"""
+        command = "set -o pipefail\n" + hide_rsync + self.backup_functions + """
 # 隔离界面和日志输出，不替换实际复制及数据库备份逻辑。
 info() { :; }
 warn() { printf '%s\\n' "$1" >&2; }
@@ -115,7 +121,7 @@ prepare_safe_copy "$1" "$2"
 
     def test_kept_database_contents_and_special_paths(self):
         """未排除的数据库应保留内容，并支持空格、换行和反斜杠文件名。"""
-        paths = ("data/with spaces.db", "data/line\nbreak.sqlite", "data/backslash\\#012.db")
+        paths = ("data/with spaces.db", "data/line\nbreak.sqlite", "data/backslash\\#012.db", "data/quote\"single'.db")
         self.create_files(*paths)
         self.assertEqual(self.prepare_copy(), set(paths))
         for relative_path in paths:
@@ -196,8 +202,78 @@ backup_dir "$1" test
 
     def test_sqlite_sidecars_remain_excluded(self):
         """安全备份保留数据库，但不复制 WAL、共享内存及回滚日志文件。"""
-        self.create_files("keep.db", "keep.db-wal", "keep.db-shm", "keep.db-journal", "notes.txt")
-        self.assertEqual(self.prepare_copy(), {"keep.db", "notes.txt"})
+        self.create_files("keep.db", "keep.db-wal", "keep.db-shm", "keep.db-journal",
+                          "other.sqlite", "other.sqlite-wal", "other.sqlite-shm", "other.sqlite-journal", "notes.txt")
+        self.assertEqual(self.prepare_copy(), {"keep.db", "other.sqlite", "notes.txt"})
+
+    def test_no_rsync_respects_filename_exclusions_and_databases(self):
+        """无 rsync 时仅为 tar 筛选保留的数据库生成快照，不能重新加入排除目录。"""
+        self.create_files("cache/hidden.db", "cache/hidden.sqlite", "keep.db", "keep.db-wal", "notes.log", "notes.txt")
+        for safe_backup in (False, True):
+            with self.subTest(safe_backup=safe_backup):
+                self.destination = Path(self.temp_dir.name) / f"backup-{safe_backup}"
+                files = self.prepare_copy("cache", "*.log", safe_backup=safe_backup, rsync_available=False)
+                expected = {"keep.db", "notes.txt"}
+                if not safe_backup:
+                    expected.add("keep.db-wal")
+                self.assertEqual(files, expected)
+
+    def test_no_rsync_does_not_keep_database_symlinks(self):
+        """无 rsync 的 SQLite 安全复制也不能留下数据库符号链接。"""
+        self.create_files("keep.db")
+        (self.source / "alias.db").symlink_to("keep.db")
+        self.assertEqual(self.prepare_copy(rsync_available=False), {"keep.db"})
+
+    def test_no_rsync_rejects_path_rules_instead_of_ignoring_them(self):
+        """tar 与 rsync 的路径语义不同；无 rsync 时必须明确拒绝路径规则。"""
+        self.create_files("cache/hidden.db", "keep.db")
+        command = self.backup_functions + r'''
+info() { :; }; warn() { printf '%s\n' "$1" >&2; }
+command() { if [[ "$1" == -v && "$2" == rsync ]]; then return 1; fi; builtin command "$@"; }
+SQLITE_SAFE_BACKUP=true
+EXCLUDE_PATTERNS=('/cache/')
+prepare_safe_copy "$1" "$2"
+'''
+        result = subprocess.run(["bash", "-c", command, "vback-test", str(self.source), str(self.destination)],
+                                text=True, capture_output=True, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("rsync is required", result.stderr)
+        self.assertFalse((self.destination / "cache" / "hidden.db").exists())
+
+    def test_snapshot_failure_aborts_before_archiving(self):
+        """SQLite 快照失败时不能以普通复制替代，且不能继续打包上传。"""
+        self.create_files("keep.db")
+        marker = Path(self.temp_dir.name) / "unexpected-archive"
+        command = self.backup_functions + load_shell_function("backup_dir") + r'''
+info() { :; }; error() { :; }; get_dir_size() { printf 0; }; count_files() { printf 0; }; fmt_size() { printf 0; }
+sqlite3() { printf 'snapshot failed\n' >&2; return 42; }
+tar() { printf 'unexpected\n' > "$ARCHIVE_MARKER"; return 1; }
+TEMP_DIR="$2"; ARCHIVE_MARKER="$3"
+SQLITE_SAFE_BACKUP=true; EXCLUDE_PATTERNS=()
+backup_dir "$1" test
+'''
+        result = subprocess.run(["bash", "-c", command, "vback-test", str(self.source), str(self.destination), str(marker)],
+                                text=True, capture_output=True, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("snapshot failed", result.stderr)
+        self.assertFalse(marker.exists())
+
+    def test_active_wal_database_contains_committed_data(self):
+        """活动 WAL 数据库的已提交数据必须进入独立快照，不能只复制主数据库文件。"""
+        database_path = self.source / "active.db"
+        with sqlite3.connect(database_path) as database:
+            self.addCleanup(database.close)
+            database.execute("PRAGMA journal_mode=WAL")
+            database.execute("CREATE TABLE sample (value TEXT)")
+            database.execute("INSERT INTO sample VALUES ('wal-data')")
+            database.commit()
+            self.assertTrue(Path(str(database_path) + "-wal").exists())
+            for rsync_available in (True, False):
+                with self.subTest(rsync_available=rsync_available):
+                    self.destination = Path(self.temp_dir.name) / f"snapshot-{rsync_available}"
+                    self.assertEqual(self.prepare_copy(rsync_available=rsync_available), {"active.db"})
+                    with sqlite3.connect(self.destination / "active.db") as snapshot:
+                        self.assertEqual(snapshot.execute("SELECT value FROM sample").fetchone(), ("wal-data",))
 
     def test_disabled_safe_backup_still_respects_excludes(self):
         """关闭安全备份时，普通复制仍应遵守相同的目录排除规则。"""

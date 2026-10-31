@@ -1,7 +1,7 @@
 #!/bin/bash
 set -o pipefail
 # ============================================================================
-# vback - 优雅的服务器备份工具 v1.4.0
+# vback - 优雅的服务器备份工具 v1.4.2
 # Elegant Server Backup Tool
 # 
 # 更方便，更省心 | Effortless & Worry-free
@@ -14,7 +14,14 @@ set -o pipefail
 # 📜 License: MIT
 # ============================================================================
 
-VERSION="1.4.0"
+VERSION="1.4.2"
+
+# 关联数组和动态数组赋值需要新版 Bash；在读取或写入用户配置前明确拒绝旧版本。
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 2))); then
+    printf '%s\n' "vback requires Bash 4.2 or newer." >&2
+    printf '%s\n' "macOS: brew install bash; /opt/homebrew/bin/bash $0" >&2
+    exit 2
+fi
 SCRIPT_NAME=$(basename "$0")
 SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || (
     # macOS fallback: resolve symlinks manually
@@ -27,8 +34,8 @@ SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || (
     done
     echo "$_dir/$_base"
 ))
-GITHUB_URL="https://github.com/caigg188/vback"
-RAW_SCRIPT_URL="https://raw.githubusercontent.com/caigg188/vback/main/vback.sh"
+GITHUB_URL="https://github.com/shenleg/vback"
+RAW_SCRIPT_URL="https://raw.githubusercontent.com/shenleg/vback/main/vback.sh"
 
 # ========================= 数据目录 =========================
 DATA_DIR="${VBACK_DATA_DIR:-$HOME/.vback}"
@@ -75,7 +82,7 @@ CLI_SCHEDULED=false
 RUN_CONTEXT="interactive"
 
 # 运行时变量
-LOCK_DIR=""  # set by acquire_lock using mktemp -d
+LOCK_DIR=""  # set by acquire_lock using mkdir
 LOCK_FILE=""
 TEMP_DIR=""  # set by init_temp_dir using mktemp -d
 S3CMD_CFG="" # set by init_temp_dir using mktemp
@@ -85,11 +92,11 @@ LOG_MAX_SIZE=10485760
 LOG_BACKUP_COUNT=5
 CURRENT_LANG="en"
 
-# 初始化临时目录（使用 mktemp 避免可预测路径的符号链接攻击）
+# 创建不可预测的临时目录和 S3 配置文件；无参数，创建或权限设置失败返回非零。
 init_temp_dir() {
-    TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/vback.XXXXXX" 2>/dev/null) || TEMP_DIR="/tmp/vback-$$"
-    S3CMD_CFG=$(mktemp "${TMPDIR:-/tmp}/.s3cfg-vback.XXXXXX" 2>/dev/null) || S3CMD_CFG="/tmp/.s3cfg-vback-$$"
-    chmod 600 "$S3CMD_CFG" 2>/dev/null
+    TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/vback.XXXXXX") || return 1
+    S3CMD_CFG=$(mktemp "${TMPDIR:-/tmp}/.s3cfg-vback.XXXXXX") || return 1
+    chmod 600 "$S3CMD_CFG"
 }
 
 # ============================================================================
@@ -411,7 +418,7 @@ load_lang_en() {
     L[available_backups]="Available backups"
     L[upload_verify_failed]="Upload verification failed (MD5 mismatch)"
     L[warn_optional_deps]="Optional tools missing (some features may not work)"
-    L[warn_no_rsync]="rsync not available: using cp fallback (exclude patterns and SQLite safe backup may not work)"
+    L[warn_no_rsync]="rsync not available: using tar with filename exclusions; path-based rules require rsync"
     L[compress_partial_warning]="Some files could not be read (partial backup)"
     L[cli_opt_verbose]="Verbose output"
     L[cli_opt_config]="Config file path"
@@ -739,7 +746,7 @@ load_lang_zh() {
     L[available_backups]="可用的备份"
     L[upload_verify_failed]="上传校验失败 (MD5 不匹配)"
     L[warn_optional_deps]="可选工具缺失 (部分功能可能不可用)"
-    L[warn_no_rsync]="rsync 不可用: 使用 cp 替代 (排除规则和 SQLite 安全备份可能失效)"
+    L[warn_no_rsync]="rsync 不可用：使用 tar 并应用文件名排除规则；路径和目录规则需要安装 rsync"
     L[compress_partial_warning]="部分文件无法读取 (不完整备份)"
     L[cli_opt_verbose]="详细输出"
     L[cli_opt_config]="配置文件路径"
@@ -846,9 +853,12 @@ get_provider_name() {
     echo "${PROVIDERS[${provider}_name]:-$provider}"
 }
 
+# 返回厂商的默认 Endpoint，并以默认 Region 替换占位符；参数为厂商标识，无异常。
 get_default_endpoint() {
     local provider="$1"
-    echo "${PROVIDERS[${provider}_endpoint]:-}"
+    local endpoint="${PROVIDERS[${provider}_endpoint]:-}"
+    local region="${PROVIDERS[${provider}_region]:-}"
+    printf '%s\n' "${endpoint//\{region\}/$region}"
 }
 
 get_default_region() {
@@ -1193,30 +1203,210 @@ save_current_task_context() {
     task_set_array "$task_id" EXCLUDES "${EXCLUDE_PATTERNS[@]}"
 }
 
-# 验证数据文件安全性：确保只包含合法的 shell 赋值语句
+# 在终端和日志中报告配置错误；参数为包含文件位置的消息，无返回数据。
+data_file_error() {
+    printf '%s\n' "$1" >&2
+    log_error "$1"
+}
+
+# 检查数据文件的所有者和权限；参数为文件路径，失败时记录原因并返回非零。
 validate_data_file() {
-    local file="$1"
-    [[ ! -f "$file" ]] && return 1
-    # 检查文件是否包含可疑内容（命令替换、管道、重定向等）
-    local suspicious
-    suspicious=$(grep -n '`\|^\s*exec\s\|^\s*source\s\|^\s*\.\s\||\s*>\s*\$(' "$file" 2>/dev/null | grep -v '^#' | head -1)
-    if [[ -n "$suspicious" ]]; then
-        log_error "Security: suspicious content in $file: $suspicious"
+    local file="$1" owner perms current_uid
+    if [[ ! -f "$file" || -L "$file" || ! -r "$file" ]]; then
+        data_file_error "Invalid data file $file: not a readable regular file"
+        return 1
+    fi
+    current_uid="$(id -u)"
+    owner="$(stat -c %u "$file" 2>/dev/null || stat -f %u "$file" 2>/dev/null)"
+    perms="$(stat -c %a "$file" 2>/dev/null || stat -f %OLp "$file" 2>/dev/null)"
+    if [[ "$owner" != "$current_uid" || "$perms" != 600 ]]; then
+        data_file_error "Invalid data file $file: owner must be current user and permissions must be 600"
+        return 1
+    fi
+}
+
+# 解码一个受支持的 Shell 字面量；参数为原文，结果写入 DATA_WORD，格式错误返回非零。
+# 仅解析字面量而不交给 Shell 执行；双引号内的扩展和未转义元字符均被拒绝。
+decode_data_word() {
+    local raw="$1" char next mode=plain decoded="" escape digits expanded i limit
+    DATA_WORD=""
+    for ((i=0; i<${#raw}; i++)); do
+        char="${raw:i:1}"
+        case "$mode" in
+            plain)
+                case "$char" in
+                    "'") mode=single ;;
+                    '"') mode=double ;;
+                    '$')
+                        [[ "${raw:i+1:1}" == "'" ]] || return 1
+                        mode=ansi; ((i+=1)) ;;
+                    '\')
+                        ((i+=1)); ((i<${#raw})) || return 1
+                        decoded+="${raw:i:1}" ;;
+                    [[:space:]]|'`'|'('|')'|'{'|'}'|'|'|'&'|';'|'<'|'>'|'*'|'?'|'['|']'|'#') return 1 ;;
+                    *) decoded+="$char" ;;
+                esac ;;
+            single)
+                if [[ "$char" == "'" ]]; then mode=plain; else decoded+="$char"; fi ;;
+            double)
+                case "$char" in
+                    '"') mode=plain ;;
+                    '$'|'`') return 1 ;;
+                    '\')
+                        ((i+=1)); ((i<${#raw})) || return 1
+                        next="${raw:i:1}"
+                        case "$next" in '$'|'`'|'"'|'\') decoded+="$next" ;; *) decoded+="\\$next" ;; esac ;;
+                    *) decoded+="$char" ;;
+                esac ;;
+            ansi)
+                if [[ "$char" == "'" ]]; then
+                    mode=plain
+                elif [[ "$char" == '\' ]]; then
+                    ((i+=1)); ((i<${#raw})) || return 1
+                    next="${raw:i:1}"
+                    case "$next" in
+                        "'"|'"'|'?') decoded+="$next" ;;
+                        c) return 1 ;;
+                        [0-7]|x|u|U)
+                            digits=""; limit=0
+                            case "$next" in
+                                [0-7]) digits="$next"; limit=3 ;;
+                                x) limit=2 ;; u) limit=4 ;; U) limit=8 ;;
+                            esac
+                            while ((${#digits}<limit && i+1<${#raw})); do
+                                char="${raw:i+1:1}"
+                                if [[ "$next" == [0-7] ]]; then
+                                    [[ "$char" == [0-7] ]] || break
+                                else
+                                    [[ "$char" == [0-9a-fA-F] ]] || break
+                                fi
+                                digits+="$char"; ((i+=1))
+                            done
+                            [[ -n "$digits" ]] || return 1
+                            if [[ "$next" == [0-7] ]]; then escape="\0$digits"; else escape="\\$next$digits"; fi
+                            printf -v expanded '%b' "$escape" || return 1
+                            # Bash 变量无法保存 NUL，不能静默改变输入。
+                            [[ -n "$expanded" ]] || return 1
+                            decoded+="$expanded" ;;
+                        *) printf -v expanded '%b' "\\$next"; decoded+="$expanded" ;;
+                    esac
+                else
+                    decoded+="$char"
+                fi ;;
+        esac
+    done
+    [[ "$mode" == plain ]] || return 1
+    DATA_WORD="$decoded"
+}
+
+# 按文件类型和字段白名单解析数据；参数为路径及类型，格式或权限错误返回非零。
+load_data_file() {
+    local file="$1" kind="$2" line key raw array_name="" index=0 line_no=0 is_array
+    local DATA_WORD
+    validate_data_file "$file" || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_no+=1))
+        # 只去除缩进：%q 可能以反斜杠加空格结尾，不能裁掉行尾。
+        line="${line#"${line%%[![:space:]]*}"}"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        if [[ -n "$array_name" ]]; then
+            if [[ "$line" == ')' ]]; then array_name=""; continue; fi
+            if ! decode_data_word "$line"; then
+                data_file_error "Invalid data file $file:$line_no: invalid array element"
+                return 1
+            fi
+            if [[ "$array_name" == TASK_IDS || "$array_name" == SCHEDULE_IDS ]]; then
+                if [[ ! "$DATA_WORD" =~ ^[A-Za-z0-9_]+$ ]]; then
+                    data_file_error "Invalid data file $file:$line_no: invalid identifier"
+                    return 1
+                fi
+            fi
+            printf -v "${array_name}[${index}]" '%s' "$DATA_WORD"
+            ((index+=1))
+            continue
+        fi
+        if [[ ! "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            data_file_error "Invalid data file $file:$line_no: unsupported statement"
+            return 1
+        fi
+        key="${BASH_REMATCH[1]}"; raw="${BASH_REMATCH[2]}"; is_array=false
+        case "$kind:$key" in
+            config:CLOUD_PROVIDER|config:S3_ACCESS_KEY|config:S3_SECRET_KEY|config:S3_ENDPOINT|config:S3_BUCKET|config:S3_REGION|config:BACKUP_PREFIX|config:MAX_BACKUPS|config:COMPRESS_BACKUP|config:COMPRESSION_LEVEL|config:SQLITE_SAFE_BACKUP|config:SCHEDULE_CRON|config:ACTIVE_TASK_ID|config:DEFAULT_TASK_ID|tasks:ACTIVE_TASK_ID|tasks:DEFAULT_TASK_ID) ;;
+            config:BACKUP_DIRS|config:EXCLUDE_PATTERNS|tasks:TASK_IDS|schedules:SCHEDULE_IDS) is_array=true ;;
+            *)
+                if [[ "$kind" == tasks && "$key" =~ ^TASK_(DIRS|EXCLUDES)_[A-Za-z0-9_]+$ ]]; then
+                    is_array=true
+                elif [[ "$kind" == tasks && "$key" =~ ^TASK_(NAME|PREFIX|MAX_BACKUPS|COMPRESS|COMPRESSION_LEVEL|SQLITE_SAFE)_[A-Za-z0-9_]+$ ]] ||
+                     [[ "$kind" == schedules && "$key" =~ ^SCHEDULE_(NAME|TASK|CRON)_[A-Za-z0-9_]+$ ]]; then
+                    :
+                else
+                    data_file_error "Invalid data file $file:$line_no: unsupported field $key"
+                    return 1
+                fi ;;
+        esac
+        if [[ "$is_array" == true ]]; then
+            if [[ "$raw" != '(' && "$raw" != '()' ]]; then
+                data_file_error "Invalid data file $file:$line_no: expected array for $key"
+                return 1
+            fi
+            unset "$key"
+            declare -g -a "$key"
+            if [[ "$raw" == '(' ]]; then array_name="$key"; index=0; fi
+        else
+            if ! decode_data_word "$raw"; then
+                data_file_error "Invalid data file $file:$line_no: invalid value for $key"
+                return 1
+            fi
+            # 这些字段随后参与算术和开关判断，必须在外部数据入口验证，而不是交给 Shell 再解释。
+            case "$key" in
+                MAX_BACKUPS|TASK_MAX_BACKUPS_*)
+                    if [[ ! "$DATA_WORD" =~ ^(0|[1-9][0-9]*)$ ]]; then
+                        data_file_error "Invalid data file $file:$line_no: expected nonnegative integer for $key"
+                        return 1
+                    fi ;;
+                COMPRESSION_LEVEL|TASK_COMPRESSION_LEVEL_*)
+                    if [[ ! "$DATA_WORD" =~ ^[1-9]$ ]]; then
+                        data_file_error "Invalid data file $file:$line_no: expected compression level 1-9 for $key"
+                        return 1
+                    fi ;;
+                COMPRESS_BACKUP|SQLITE_SAFE_BACKUP|TASK_COMPRESS_*|TASK_SQLITE_SAFE_*)
+                    if [[ "$DATA_WORD" != true && "$DATA_WORD" != false ]]; then
+                        data_file_error "Invalid data file $file:$line_no: expected true or false for $key"
+                        return 1
+                    fi ;;
+            esac
+            # 标识符会用于动态变量名，不能包含 Shell 元字符。
+            if [[ "$key" == ACTIVE_TASK_ID || "$key" == DEFAULT_TASK_ID || "$key" == SCHEDULE_TASK_* ]]; then
+                if [[ -n "$DATA_WORD" && ! "$DATA_WORD" =~ ^[A-Za-z0-9_]+$ ]]; then
+                    data_file_error "Invalid data file $file:$line_no: invalid identifier for $key"
+                    return 1
+                fi
+            fi
+            printf -v "$key" '%s' "$DATA_WORD"
+        fi
+    done < "$file"
+    if [[ -n "$array_name" ]]; then
+        data_file_error "Invalid data file $file:$line_no: unterminated array $array_name"
         return 1
     fi
     return 0
 }
 
+# 加载任务文件；文件缺失视为首次启动，解析或权限错误返回非零。
 load_tasks_store() {
-    [[ -f "$TASKS_FILE" ]] && validate_data_file "$TASKS_FILE" && source "$TASKS_FILE"
+    [[ ! -e "$TASKS_FILE" && ! -L "$TASKS_FILE" ]] && return 0
+    load_data_file "$TASKS_FILE" tasks
 }
 
+# 加载计划文件；文件缺失视为首次启动，解析或权限错误返回非零。
 load_schedules_store() {
-    [[ -f "$SCHEDULES_FILE" ]] && validate_data_file "$SCHEDULES_FILE" && source "$SCHEDULES_FILE"
+    [[ ! -e "$SCHEDULES_FILE" && ! -L "$SCHEDULES_FILE" ]] && return 0
+    load_data_file "$SCHEDULES_FILE" schedules
 }
 
+# 保存任务定义；无参数，目录创建、写入或权限设置失败返回非零。
 save_tasks_store() {
-    init_data_dir
+    init_data_dir || return 1
     
     {
         echo "# vback tasks file"
@@ -1249,13 +1439,14 @@ save_tasks_store() {
             echo ")"
             echo ""
         done
-    } > "$TASKS_FILE"
+    } > "$TASKS_FILE" || return 1
     
     chmod 600 "$TASKS_FILE"
 }
 
+# 保存计划定义；无参数，目录创建、写入或权限设置失败返回非零。
 save_schedules_store() {
-    init_data_dir
+    init_data_dir || return 1
     
     {
         echo "# vback schedules file"
@@ -1273,7 +1464,7 @@ save_schedules_store() {
             printf 'SCHEDULE_CRON_%s=%q\n' "$schedule_id" "$(schedule_get_scalar "$schedule_id" CRON)"
             echo ""
         done
-    } > "$SCHEDULES_FILE"
+    } > "$SCHEDULES_FILE" || return 1
     
     chmod 600 "$SCHEDULES_FILE"
 }
@@ -1323,19 +1514,23 @@ ensure_task_store() {
     fi
 }
 
+# 加载配置、任务和计划；文件缺失视为首次启动，任一文件错误时立即返回非零。
 load_config() {
-    [[ -f "$CONFIG_FILE" ]] && validate_data_file "$CONFIG_FILE" && source "$CONFIG_FILE"
-    load_tasks_store
-    load_schedules_store
+    if [[ -e "$CONFIG_FILE" || -L "$CONFIG_FILE" ]]; then
+        load_data_file "$CONFIG_FILE" config || return 1
+    fi
+    load_tasks_store || return 1
+    load_schedules_store || return 1
     migrate_legacy_config
     ensure_task_store
 }
 
+# 保存当前任务、计划及兼容旧版的全局配置；无参数，任一文件写入失败返回非零。
 save_config() {
-    init_data_dir
+    init_data_dir || return 1
     save_current_task_context
-    save_tasks_store
-    save_schedules_store
+    save_tasks_store || return 1
+    save_schedules_store || return 1
     
     local mirror_task_id="$(resolve_default_task_id)"
     local mirror_prefix="" mirror_max_backups=7 mirror_compress=true mirror_compression_level=6 mirror_sqlite_safe=true
@@ -1356,7 +1551,7 @@ save_config() {
         mirror_schedule_cron="$(schedule_get_scalar "${SCHEDULE_IDS[0]}" CRON)"
     fi
     
-    cat > "$CONFIG_FILE" << EOF
+    cat > "$CONFIG_FILE" << EOF || return 1
 # vback configuration file
 # Generated: $(date '+%Y-%m-%d %H:%M:%S')
 
@@ -1869,7 +2064,8 @@ s3_put() {
     return $rc
 }
 
-# 上传后 MD5 校验
+# 验证上传对象；参数为本地文件和相对对象名，校验不符或分片抽样下载失败返回非零。
+# 普通 ETag 比较完整 MD5；分片 ETag 不是 MD5，AWS 改为抽查首个 MiB。
 s3_verify_upload() {
     local src="$1" dst=$(build_s3_path "$2")
     local local_md5 remote_md5
@@ -1897,7 +2093,33 @@ s3_verify_upload() {
         return 0
     fi
 
-    if [[ "$local_md5" == "$remote_md5" ]]; then
+    if [[ "$remote_md5" == *-* ]]; then
+        if [[ "$S3_TOOL" != "aws" ]]; then
+            log_warn "Upload completed; multipart ETag is not a plain MD5, content verification skipped"
+            return 0
+        fi
+        local remote_sample="${TEMP_DIR}/remote-sample-$$" local_sample="${TEMP_DIR}/local-sample-$$"
+        if ! aws s3api get-object --bucket "$S3_BUCKET" --key "$dst" --range bytes=0-1048575 $AWS_ENDPOINT "$remote_sample" >/dev/null 2>&1; then
+            log_error "Upload verification failed: multipart sample download failed"
+            return 1
+        fi
+        # 1 MiB 抽样避免为校验分片 ETag 而重新下载整个大文件；它不是全文件校验。
+        dd if="$src" of="$local_sample" bs=1048576 count=1 2>/dev/null || return 1
+        local local_sample_md5 remote_sample_md5
+        if command -v md5sum &>/dev/null; then
+            local_sample_md5=$(md5sum "$local_sample" | awk '{print $1}')
+            remote_sample_md5=$(md5sum "$remote_sample" | awk '{print $1}')
+        else
+            local_sample_md5=$(md5 -q "$local_sample")
+            remote_sample_md5=$(md5 -q "$remote_sample")
+        fi
+        if [[ "$local_sample_md5" != "$remote_sample_md5" ]]; then
+            log_error "Upload verification failed: multipart sample mismatch"
+            return 1
+        fi
+        log_info "Upload verified: multipart first-MiB sample match"
+        return 0
+    elif [[ "$local_md5" == "$remote_md5" ]]; then
         log_info "Upload verified: MD5 match ($local_md5)"
         return 0
     else
@@ -1924,29 +2146,32 @@ s3_rm() {
     fi
 }
 
+# 上传并删除唯一的测试对象；无参数，上传或清理失败时返回非零。
 s3_test() {
     info "${L[testing_connection]}"
     local test_file
-    test_file=$(mktemp "${TMPDIR:-/tmp}/vback-test.XXXXXX.txt" 2>/dev/null) || test_file="/tmp/vback-test-$$.txt"
-    echo "vback-test-$(date +%s)" > "$test_file"
-    
+    test_file=$(mktemp "${TMPDIR:-/tmp}/vback-test.XXXXXX") || return 1
+    printf 'vback-test-%s\n' "$(date +%s)" > "$test_file"
+
     local start=$(date +%s)
-    local result
-    if [[ "$S3_TOOL" == "s3cmd" ]]; then
-        result=$(s3cmd -c "$S3CMD_CFG" put "$test_file" "s3://${S3_BUCKET}/.vback-test" 2>&1)
-    else
-        result=$(aws s3 cp "$test_file" "s3://${S3_BUCKET}/.vback-test" $AWS_ENDPOINT 2>&1)
-    fi
+    local result rc test_key=".$(basename "$test_file")"
+    result=$(s3_put "$test_file" "$test_key" false)
+    rc=$?
     local duration=$(($(date +%s) - start))
     rm -f "$test_file"
-    
-    if echo "$result" | grep -qi "error\|fail\|denied\|invalid"; then
+
+    # 上传和清理均经由相同的 Prefix 构造，避免遗留不在任务前缀下的测试对象。
+    local cleanup_rc=0
+    s3_rm "$test_key" &>/dev/null || cleanup_rc=$?
+    if [[ $rc -ne 0 ]]; then
         error "${L[connection_failed]}"
-        echo "$result" | head -3 | sed 's/^/    /'
+        printf '%s\n' "$result" | head -3 | sed 's/^/    /'
         return 1
     fi
-    
-    s3_rm ".vback-test" &>/dev/null
+    if [[ $cleanup_rc -ne 0 ]]; then
+        error "${L[connection_failed]}: cannot remove test object $test_key"
+        return 1
+    fi
     success "${L[connection_success]} (${duration}s)"
     return 0
 }
@@ -1955,6 +2180,7 @@ s3_test() {
 # 配置验证
 # ============================================================================
 
+# 验证任务必需配置和来源目录；参数为任务 ID（默认当前任务），不完整或 basename 重复返回非零。
 validate_config() {
     local task_id="${1:-${CURRENT_TASK_ID:-${DEFAULT_TASK_ID:-${TASK_IDS[0]}}}}"
     [[ -n "$task_id" && "$CURRENT_TASK_ID" != "$task_id" ]] && load_task_context "$task_id"
@@ -1965,8 +2191,16 @@ validate_config() {
     [[ -z "$S3_BUCKET" ]] && errors+=("${L[bucket]} ${L[not_set]}")
     [[ ${#BACKUP_DIRS[@]} -eq 0 ]] && errors+=("${L[backup_directories]} ${L[not_set]}")
     
+    local -A seen_names=()
+    local d base_name
     for d in "${BACKUP_DIRS[@]}"; do
         [[ ! -d "$d" ]] && errors+=("$d ${L[not_exist]}")
+        base_name="$(basename "$d")"
+        if [[ -n "${seen_names[$base_name]:-}" ]]; then
+            errors+=("Duplicate source name '$base_name': ${seen_names[$base_name]} and $d")
+        else
+            seen_names[$base_name]="$d"
+        fi
     done
     
     if [[ ${#errors[@]} -gt 0 ]]; then
@@ -1983,17 +2217,20 @@ validate_config() {
 # SQLite 安全备份
 # ============================================================================
 
+# 生成包含 WAL 已提交数据的 SQLite 快照；参数为源数据库和目标文件，sqlite3 缺失或备份失败返回非零。
 backup_sqlite_db() {
-    local db_file="$1" backup_file="$2"
-    if command -v sqlite3 &>/dev/null; then
-        # 使用 .backup 命令的参数化形式，避免 SQL 注入
-        sqlite3 "$db_file" ".backup" "$backup_file" 2>/dev/null && return 0
-    fi
-    cp "$db_file" "$backup_file" 2>/dev/null
+    local db_file="$1" backup_file="$2" quoted
+    # SQLite CLI 把每个额外参数当成独立命令；.backup 和路径必须放在同一个参数内。
+    # 双引号参数支持 C 转义，需保护文件名中的反斜杠、引号及换行，不能改用普通复制。
+    quoted="${backup_file//\\/\\\\}"
+    quoted="${quoted//\"/\\\"}"
+    quoted="${quoted//$'\n'/\\n}"
+    quoted="${quoted//$'\r'/\\r}"
+    sqlite3 "$db_file" ".backup \"$quoted\""
 }
 
 # 将源目录复制到临时备份目录，SQLite 安全备份也遵守用户排除规则。
-# 参数：源目录、临时备份目录。输出成功备份的数据库数量；数据库筛选失败时返回非零状态。
+# 参数：源目录、临时备份目录。输出快照数量；筛选、复制或数据库快照失败返回非零，禁止继续上传。
 prepare_safe_copy() {
     local src_dir="$1" dest_dir="$2"
     local db_count=0
@@ -2027,20 +2264,42 @@ prepare_safe_copy() {
                 rel_path+="$encoded_path"
                 [[ -f "$src_dir/$rel_path" && ! -L "$src_dir/$rel_path" ]] && db_files+=("$src_dir/$rel_path")
             done <<< "$db_list"
-        else
-            while IFS= read -r -d '' db_file; do
-                db_files+=("$db_file")
-            done < <(find "$src_dir" -type f \( -name "*.db" -o -name "*.sqlite" \) -print0 2>/dev/null)
         fi
         exclude_args+=(--exclude='*.db' --exclude='*.sqlite')
         exclude_args+=(--exclude='*.db-wal' --exclude='*.db-shm' --exclude='*.db-journal')
+        exclude_args+=(--exclude='*.sqlite-wal' --exclude='*.sqlite-shm' --exclude='*.sqlite-journal')
     fi
 
     if command -v rsync &>/dev/null; then
-        rsync -a "${exclude_args[@]}" "$src_dir/" "$dest_dir/" 2>/dev/null
+        rsync -a "${exclude_args[@]}" "$src_dir/" "$dest_dir/" 2>/dev/null || return 1
     else
-        # cp -a 在 macOS 上可能不可用，使用 cp -pR 作为 fallback
-        cp -a "$src_dir/." "$dest_dir/" 2>/dev/null || cp -pR "$src_dir/." "$dest_dir/" 2>/dev/null
+        local -a tar_excludes=()
+        for p in "${EXCLUDE_PATTERNS[@]}"; do
+            # GNU tar 和 BSD tar 的路径及目录规则不同于 rsync，不能静默按另一种含义备份。
+            if [[ "$p" == */* ]]; then
+                warn "rsync is required for path-based exclusion rules: $p"
+                return 1
+            fi
+            tar_excludes+=("--exclude=$p")
+        done
+        if [[ "$SQLITE_SAFE_BACKUP" == "true" ]]; then
+            tar_excludes+=(--exclude='*.db-wal' --exclude='*.db-shm' --exclude='*.db-journal')
+            tar_excludes+=(--exclude='*.sqlite-wal' --exclude='*.sqlite-shm' --exclude='*.sqlite-journal')
+        fi
+        tar -cf - "${tar_excludes[@]}" -C "$src_dir" . 2>/dev/null | tar -xf - -C "$dest_dir" 2>/dev/null || return 1
+        # 无 rsync 时，以 tar 实际选中的文件为准，再用安全快照替换数据库，不能从源目录找回已排除项。
+        if [[ "$SQLITE_SAFE_BACKUP" == "true" ]]; then
+            local copied_db
+            while IFS= read -r -d '' copied_db; do
+                db_files+=("$src_dir/${copied_db#$dest_dir/}")
+                # 原始副本只用于确定筛选结果；必须重建目标，避免继承 WAL 模式并把快照写进临时 WAL。
+                rm -f "$copied_db" || return 1
+            done < <(find "$dest_dir" -type f \( -name "*.db" -o -name "*.sqlite" \) -print0)
+            # 与 rsync 分支一致：数据库符号链接既不生成快照，也不保留原链接。
+            while IFS= read -r -d '' copied_db; do
+                rm -f "$copied_db" || return 1
+            done < <(find "$dest_dir" -type l \( -name "*.db" -o -name "*.sqlite" \) -print0)
+        fi
         warn "${L[warn_no_rsync]}"
     fi
 
@@ -2049,7 +2308,8 @@ prepare_safe_copy() {
             local rel_path="${db_file#$src_dir/}"
             local dest_file="$dest_dir/$rel_path"
             mkdir -p "$(dirname "$dest_file")"
-            backup_sqlite_db "$db_file" "$dest_file" && ((db_count++))
+            backup_sqlite_db "$db_file" "$dest_file" || return 1
+            ((db_count+=1))
         done
 
         [[ $db_count -gt 0 ]] && info "SQLite: ${C_NUMBER}${db_count}${C_RESET} ${L[sqlite_dbs]}"
@@ -2186,7 +2446,11 @@ backup_dir() {
     local work_dir="$TEMP_DIR/${name}"
     
     info "${L[preparing_files]}..."
-    prepare_safe_copy "$src" "$work_dir" || return 1
+    if ! prepare_safe_copy "$src" "$work_dir"; then
+        error "${L[backup_failed]}: ${L[preparing_files]}"
+        rm -rf "$work_dir"
+        return 1
+    fi
     
     local archive_file s3_key
     if [[ "$COMPRESS_BACKUP" == "true" ]]; then
@@ -2245,10 +2509,7 @@ backup_dir() {
     rm -f "$archive_file"
     local total_duration=$(($(date +%s) - start))
 
-    local output_has_error=false
-    [[ -n "$result" ]] && echo "$result" | grep -qi "error\|fail" && output_has_error=true
-
-    if [[ $rc -eq 0 && $verify_rc -eq 0 && "$output_has_error" != "true" ]]; then
+    if [[ $rc -eq 0 && $verify_rc -eq 0 ]]; then
         local speed=$(fmt_speed $archive_size $upload_duration)
         success "${L[upload_complete]}: ${C_PATH}${s3_key}${C_RESET}"
         info "${L[transfer]}: ${C_NUMBER}$(fmt_size $archive_size)${C_RESET} @ ${C_NUMBER}${speed}/s${C_RESET}"
@@ -2363,14 +2624,16 @@ remove_all_cron_jobs() {
     printf '%s\n' "$current_crontab" | grep -v -F "$SCRIPT_PATH" | crontab - 2>/dev/null
 }
 
+# 生成使用当前 Bash 的 cron 命令；参数为任务和计划 ID，输出可直接执行的命令，无外部操作。
 build_cron_command() {
     local task_id="$1" schedule_id="$2"
-    local script_q task_q schedule_q log_q
+    local bash_q script_q task_q schedule_q log_q
+    printf -v bash_q '%q' "$BASH"
     printf -v script_q '%q' "$SCRIPT_PATH"
     printf -v task_q '%q' "$task_id"
     printf -v schedule_q '%q' "$schedule_id"
     printf -v log_q '%q' "$LOG_FILE"
-    printf '%s backup --task-id %s --scheduled --schedule-id %s >> %s 2>&1' "$script_q" "$task_q" "$schedule_q" "$log_q"
+    printf '%s %s backup --task-id %s --scheduled --schedule-id %s >> %s 2>&1' "$bash_q" "$script_q" "$task_q" "$schedule_q" "$log_q"
 }
 
 sync_cron_jobs() {
@@ -2468,6 +2731,7 @@ compare_versions() {
     echo "equal"
 }
 
+# 确认后从本分支发布地址更新脚本并保留原文件；无参数，下载、语法检查或写入失败返回非零。
 do_update() {
     info "${L[checking_update]}"
     echo ""
@@ -2496,26 +2760,34 @@ do_update() {
             
             # 备份旧脚本
             local backup_file="${SCRIPT_PATH}.backup.$(date +%Y%m%d_%H%M%S)"
-            cp "$SCRIPT_PATH" "$backup_file" 2>/dev/null
-            
-            # 下载新版本
-            local new_script
-            new_script=$(curl -fsSL --connect-timeout 30 "$RAW_SCRIPT_URL" 2>/dev/null)
-            
-            if [[ -z "$new_script" ]]; then
-                error "${L[download_failed]}"
+            if ! cp "$SCRIPT_PATH" "$backup_file"; then
+                error "${L[update_failed]}: cannot create backup $backup_file"
+                return 1
+            fi
+
+            # 保留 curl 的具体失败原因，不能把部分下载内容当作完整的新脚本。
+            local new_script curl_error curl_exit
+            curl_error=$(mktemp "${TEMP_DIR}/update-error.XXXXXX") || return 1
+            new_script=$(curl -fsSL --connect-timeout 30 "$RAW_SCRIPT_URL" 2>"$curl_error")
+            curl_exit=$?
+            if [[ $curl_exit -ne 0 || -z "$new_script" ]]; then
+                error "${L[download_failed]}: $RAW_SCRIPT_URL (exit $curl_exit)"
+                head -3 "$curl_error" | sed 's/^/    /'
                 return 1
             fi
             
             # 验证下载的脚本
-            if ! echo "$new_script" | grep -q '^#!/bin/bash'; then
-                error "${L[download_failed]}"
+            if [[ "$new_script" != '#!/bin/bash'* ]] || ! "$BASH" -n <<< "$new_script"; then
+                error "${L[download_failed]}: invalid Bash script"
                 return 1
             fi
-            
+
             # 写入新脚本
-            echo "$new_script" > "$SCRIPT_PATH"
-            chmod +x "$SCRIPT_PATH"
+            if ! printf '%s\n' "$new_script" > "$SCRIPT_PATH"; then
+                error "${L[update_failed]}: cannot write $SCRIPT_PATH"
+                return 1
+            fi
+            chmod +x "$SCRIPT_PATH" || return 1
             
             echo ""
             success "${L[update_success]}"
@@ -2537,6 +2809,34 @@ do_update() {
 # 恢复功能
 # ============================================================================
 
+# 检查归档是否只含安全的相对路径、普通文件和目录；参数为归档及压缩开关，不安全或损坏返回非零。
+validate_restore_archive() {
+    local archive="$1" compressed="$2" entries verbose entry
+    local list_cmd=(-tf "$archive") verbose_cmd=(-tvf "$archive")
+    if [[ "$compressed" == "true" ]]; then
+        list_cmd=(-tzf "$archive")
+        verbose_cmd=(-tzvf "$archive")
+    fi
+    if ! entries=$(tar "${list_cmd[@]}" 2>/dev/null); then
+        log_error "Invalid restore archive: $archive"
+        return 1
+    fi
+    while IFS= read -r entry; do
+        if [[ "$entry" == /* || "/$entry/" == *"/../"* ]]; then
+            log_error "Unsafe archive path rejected: $entry"
+            return 1
+        fi
+    done <<< "$entries"
+    verbose=$(tar "${verbose_cmd[@]}" 2>/dev/null) || return 1
+    # 链接和设备节点可能把后续文件写出恢复目录，因此即使链接目标看似安全也一律拒绝。
+    if LC_ALL=C grep -Eq '^[lhcbps]' <<< "$verbose"; then
+        log_error "Archive contains links or special files"
+        return 1
+    fi
+    return 0
+}
+
+# 下载并恢复任务归档；参数为相对对象名和目标目录，下载、校验或解压失败返回非零。
 do_restore() {
     local s3_key="$1" dest_dir="$2"
 
@@ -2570,13 +2870,22 @@ do_restore() {
         return 1
     fi
 
+    if [[ "$filename" == *.tar.gz || "$filename" == *.tar ]]; then
+        local compressed=false
+        [[ "$filename" == *.tar.gz ]] && compressed=true
+        if ! validate_restore_archive "$local_file" "$compressed"; then
+            error "${L[restore_failed]}: unsafe or invalid archive"
+            return 1
+        fi
+    fi
+
     info "${L[extracting]}: ${C_PATH}${filename}${C_RESET} -> ${C_PATH}${dest_dir}${C_RESET}"
-    mkdir -p "$dest_dir"
+    mkdir -p "$dest_dir" || return 1
 
     if [[ "$filename" == *.tar.gz ]]; then
-        tar -xzf "$local_file" -C "$dest_dir"
+        tar -xzf "$local_file" -C "$dest_dir" --no-same-owner
     elif [[ "$filename" == *.tar ]]; then
-        tar -xf "$local_file" -C "$dest_dir"
+        tar -xf "$local_file" -C "$dest_dir" --no-same-owner
     else
         cp "$local_file" "$dest_dir/"
     fi
@@ -2594,7 +2903,9 @@ do_restore() {
     return 0
 }
 
+# 交互选择远端备份并恢复；无参数，取消返回成功，下载或归档校验失败返回非零。
 menu_restore() {
+    local restore_rc=0
     show_header
     echo -e "  ${C_TITLE}▸ ${L[restore_title]}${C_RESET}"
     echo ""
@@ -2621,7 +2932,7 @@ menu_restore() {
         local list=$(s3_list "${name}/")
         if [[ -n "$list" ]]; then
             echo -e "  ${C_BOLD}$name${C_RESET}"
-            echo "$list" | while read -r line; do
+            while read -r line; do
                 local fn=$(echo "$line" | awk '{print $4}' | xargs basename 2>/dev/null)
                 local dt=$(echo "$line" | awk '{print $1, $2}')
                 local sz=$(echo "$line" | awk '{print $3}')
@@ -2629,7 +2940,7 @@ menu_restore() {
                     backup_keys+=("${name}/${fn}")
                     printf "    ${C_MENU_NUM}%d${C_RESET}) ${C_TIMESTAMP}%-16s${C_RESET}  ${C_NUMBER}%10s${C_RESET}  ${C_PATH}%s${C_RESET}\n" "${#backup_keys[@]}" "$dt" "$sz" "$fn"
                 fi
-            done
+            done <<< "$list"
         fi
         echo ""
     done
@@ -2657,19 +2968,37 @@ menu_restore() {
         [[ -z "$dest_dir" ]] && dest_dir="."
 
         if confirm "${L[confirm_restore]} ${C_PATH}${selected_key}${C_RESET} -> ${C_PATH}${dest_dir}${C_RESET}"; then
-            do_restore "$selected_key" "$dest_dir"
+            do_restore "$selected_key" "$dest_dir" || restore_rc=$?
         else
             info "${L[operation_cancelled]}"
         fi
     fi
 
     press_enter
+    return "$restore_rc"
 }
 
 # ============================================================================
 # 重置功能
 # ============================================================================
 
+# 检查重置目录是否为系统目录或用户主目录；无参数，不安全或解析路径失败返回非零。
+validate_reset_data_dir() {
+    [[ ! -d "$DATA_DIR" ]] && return 0
+    local canonical_data canonical_home
+    canonical_data="$(cd "$DATA_DIR" && pwd -P)" || return 1
+    canonical_home="$(cd "$HOME" && pwd -P)" || return 1
+    case "$canonical_data" in
+        /|/root|/home|/Users|/tmp|/private/tmp|/var/tmp|"$canonical_home")
+            # 此检查也在初始化前运行，不能调用会创建日志目录的 error()。
+            printf '%s\n' "Refusing to reset unsafe data directory: $canonical_data" >&2
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+# 交互确认后移除本工具的配置和计划；无参数，取消、目录不安全或删除失败返回非零。
 do_reset() {
     echo ""
     print_box_top
@@ -2697,9 +3026,10 @@ do_reset() {
         return 1
     fi
     
+    validate_reset_data_dir || return 1
     echo ""
     info "Resetting..."
-    
+
     # 1. 移除定时任务
     if crontab -l 2>/dev/null | grep -qF "$SCRIPT_PATH"; then
         remove_all_cron_jobs
@@ -2708,12 +3038,12 @@ do_reset() {
     
     # 2. 删除配置目录
     if [[ -d "$DATA_DIR" ]]; then
-        rm -rf "$DATA_DIR"
+        rm -rf "$DATA_DIR" || return 1
         info "Removed ${DATA_DIR}"
     fi
     
-    # 3. 清理锁文件
-    rm -rf "${TMPDIR:-/tmp}/vback.lock" 2>/dev/null
+    # 3. 只清理本进程持有的锁和临时文件，不能移除另一个备份进程的锁。
+    rm -rf "$LOCK_DIR" "$S3CMD_CFG" "$TEMP_DIR" || return 1
     
     # 4. 重置内存中的变量
     CLOUD_PROVIDER=""
@@ -3065,7 +3395,7 @@ menu_main() {
             4) menu_cron ;;
             5) menu_edit_config ;;
             6) menu_logs ;;
-            r|R) setup_wizard; load_config ;;
+            r|R) setup_wizard; load_config || return 1 ;;
             l|L) select_language_dialog; init_providers ;;
             u|U) menu_update ;;
             x|X) menu_reset ;;
@@ -3195,6 +3525,7 @@ menu_test() {
     press_enter
 }
 
+# 编辑并保存指定任务；参数为任务 ID，返回上一级前写入配置，保存失败返回非零。
 edit_task_menu() {
     local task_id="$1"
 
@@ -3237,6 +3568,7 @@ edit_task_menu() {
                 new_task_name="$(task_display_name "$task_id")"
                 input_field "${L[task_name]}" "$new_task_name" new_task_name false
                 task_set_scalar "$task_id" NAME "$new_task_name"
+                save_config || return 1
                 ;;
             2) edit_backup_dirs ;;
             3) edit_backup_options ;;
@@ -3257,14 +3589,15 @@ edit_task_menu() {
                 press_enter
                 ;;
             0|"")
-                save_current_task_context "$task_id"
                 ACTIVE_TASK_ID="$task_id"
+                save_config || return 1
                 return
                 ;;
         esac
     done
 }
 
+# 管理备份任务并引导配置新任务；无参数，配置保存失败时返回非零。
 menu_tasks() {
     while true; do
         show_header
@@ -3309,9 +3642,10 @@ menu_tasks() {
                 create_task "$new_task_name" "$new_task_id" >/dev/null
                 ACTIVE_TASK_ID="$new_task_id"
                 load_task_context "$new_task_id"
-                save_config
+                save_config || return 1
                 success "${L[task_saved]}"
                 press_enter
+                edit_task_menu "$new_task_id"
                 ;;
             d|D)
                 if [[ ${#TASK_IDS[@]} -le 1 ]]; then
@@ -3390,6 +3724,7 @@ edit_schedule_form() {
     return 0
 }
 
+# 管理定时计划；无参数，数字编辑对应计划，x 禁用计划以免与第二项冲突。
 menu_cron() {
     while true; do
         show_header
@@ -3436,11 +3771,11 @@ menu_cron() {
         menu_item "a" "${L[add_schedule]}"
         menu_item "d" "${L[delete_schedule]}"
         menu_item "s" "${L[sync_schedules]}"
-        menu_item "2" "${L[disable_cron]}"
+        menu_item "x" "${L[disable_cron]}"
         menu_item "0" "${L[back]}"
         
         echo ""
-        echo -ne "  ${L[select_option]} ${C_MUTED}[1-${#SCHEDULE_IDS[@]}/a/d/s/2/0]${C_RESET}: "
+        echo -ne "  ${L[select_option]} ${C_MUTED}[1-${#SCHEDULE_IDS[@]}/a/d/s/x/0]${C_RESET}: "
         local choice del_idx del_schedule_id
         read -r choice
         
@@ -3471,7 +3806,7 @@ menu_cron() {
                 success "${L[cron_installed]}"
                 press_enter
                 ;;
-            2)
+            x|X)
                 if confirm "${L[confirm_disable]}"; then
                     remove_cron
                 fi
@@ -3552,6 +3887,7 @@ edit_s3_config() {
     press_enter
 }
 
+# 编辑当前任务的来源目录；无参数，手动保存或返回时写入配置，保存失败返回非零。
 edit_backup_dirs() {
     while true; do
         show_header
@@ -3576,10 +3912,11 @@ edit_backup_dirs() {
         print_line '─'
         menu_item "a" "${L[add_directory]}"
         menu_item "d" "${L[remove_directory]}"
+        menu_item "s" "${L[save]}"
         menu_item "0" "${L[back]}"
         
         echo ""
-        echo -ne "  ${L[select_option]} ${C_MUTED}[0/a/d]${C_RESET}: "
+        echo -ne "  ${L[select_option]} ${C_MUTED}[0/a/d/s]${C_RESET}: "
         read -r choice
         
         case $choice in
@@ -3620,11 +3957,20 @@ edit_backup_dirs() {
                     success "Removed: $removed"
                 fi
                 ;;
-            0|"") return ;;
+            s|S)
+                save_config || return 1
+                success "${L[task_saved]}"
+                press_enter
+                ;;
+            0|"")
+                save_config || return 1
+                return
+                ;;
         esac
     done
 }
 
+# 编辑并立即保存当前任务的备份选项；无参数，保存失败返回非零。
 edit_backup_options() {
     show_header
     echo -e "  ${C_TITLE}▸ ${L[backup_settings]}${C_RESET}"
@@ -3651,11 +3997,13 @@ edit_backup_options() {
     
     echo ""
     input_field "${L[max_backups]} (${L[max_backups_desc]})" "$MAX_BACKUPS" MAX_BACKUPS
-    
+    save_config || return 1
+
     success "${L[settings_updated]}"
     press_enter
 }
 
+# 编辑当前任务的排除规则；无参数，手动保存或返回时写入配置，保存失败返回非零。
 edit_exclude_patterns() {
     while true; do
         show_header
@@ -3675,10 +4023,11 @@ edit_exclude_patterns() {
         menu_item "a" "${L[add_pattern]}"
         menu_item "d" "${L[remove_pattern]}"
         menu_item "r" "${L[reset_default]}"
+        menu_item "s" "${L[save]}"
         menu_item "0" "${L[back]}"
         
         echo ""
-        echo -ne "  ${L[select_option]} ${C_MUTED}[0/a/d/r]${C_RESET}: "
+        echo -ne "  ${L[select_option]} ${C_MUTED}[0/a/d/r/s]${C_RESET}: "
         read -r choice
         
         case $choice in
@@ -3702,7 +4051,15 @@ edit_exclude_patterns() {
                 EXCLUDE_PATTERNS=("${DEFAULT_EXCLUDE_PATTERNS[@]}")
                 success "${L[success]}"
                 ;;
-            0|"") return ;;
+            s|S)
+                save_config || return 1
+                success "${L[task_saved]}"
+                press_enter
+                ;;
+            0|"")
+                save_config || return 1
+                return
+                ;;
         esac
     done
 }
@@ -3878,6 +4235,7 @@ show_config_cli() {
     echo ""
 }
 
+# 解析命令并执行 v1 备份工具；参数为命令行参数，配置或依赖错误以非零状态退出。
 main() {
     local COMMAND=""
     local ARG_LANG=""
@@ -3908,8 +4266,12 @@ main() {
     done
     
     setup_colors
-    init_data_dir
-    init_temp_dir
+    if [[ "$COMMAND" == reset ]]; then
+        validate_reset_data_dir || exit 1
+    fi
+    init_data_dir || exit 1
+    trap 'rm -rf "$LOCK_DIR" "$S3CMD_CFG" "$TEMP_DIR"' EXIT
+    init_temp_dir || exit 1
     
     if [[ -n "$ARG_LANG" ]]; then
         set_language "$ARG_LANG"
@@ -3922,7 +4284,7 @@ main() {
     fi
     
     init_providers
-    load_config
+    load_config || exit 1
     
     if [[ -n "$CLI_TASK_REF" && -z "$CLI_TASK_ID" ]]; then
         CLI_TASK_ID="$(resolve_task_ref "$CLI_TASK_REF")"
@@ -3942,14 +4304,25 @@ main() {
         load_task_context "$CLI_TASK_ID"
     fi
     
-    check_dependencies || exit 1
-    
-    if ! check_s3_tool; then
-        if [[ -t 0 ]] && confirm "${L[err_no_s3_tool]}. ${L[err_install_s3cmd]}"; then
-            install_s3cmd || exit 1
-            check_s3_tool
-        fi
-    fi
+    case "${COMMAND:-menu}" in
+        backup|menu|setup|test|status|restore)
+            check_dependencies || exit 1
+            ;;
+    esac
+
+    case "${COMMAND:-menu}" in
+        backup|test|status|restore)
+            if ! check_s3_tool; then
+                if [[ -t 0 ]] && confirm "${L[err_no_s3_tool]}. ${L[err_install_s3cmd]}"; then
+                    install_s3cmd || exit 1
+                    check_s3_tool || exit 1
+                else
+                    error "${L[err_no_s3_tool]}"
+                    exit 1
+                fi
+            fi
+            ;;
+    esac
     
     RUN_CONTEXT=$([[ "$CLI_SCHEDULED" == "true" ]] && echo "scheduled" || echo "cli")
     [[ "${COMMAND:-menu}" == "menu" || "${COMMAND:-menu}" == "setup" ]] && RUN_CONTEXT="interactive"
@@ -3968,7 +4341,7 @@ main() {
         menu)
             if needs_setup; then
                 setup_wizard
-                load_config
+                load_config || exit 1
             fi
             RUN_CONTEXT="interactive"
             menu_main
